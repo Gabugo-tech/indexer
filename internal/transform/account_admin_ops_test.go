@@ -1,10 +1,10 @@
 package transform
 
-// Hermetic unit tests for the "account administration & data" operation family:
-//   set_options, account_merge, bump_sequence, manage_data, inflation
+// Hermetic unit tests for the account administration & data operation family:
+// set_options, account_merge, bump_sequence, manage_data, inflation.
 //
 // No live network or fixture files are used: each test builds an xdr.Operation
-// value in memory, calls extractOperationDetails / enrichOperation directly, and
+// in memory, calls extractOperationDetails / enrichOperation directly, and
 // asserts the expected fields.
 
 import (
@@ -16,25 +16,20 @@ import (
 	"github.com/miguelnietoa/stellar-explorer/indexer/internal/store"
 )
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-// testAccountA and testAccountB reuse the same addresses as claimable_sponsorship_test.go
-// (claimantAddr / sponsoredAddr) — defined here for readability within this file.
-// NOTE: these must not conflict with constants in sibling test files in the same package.
 const (
 	acctA = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H"
 	acctB = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
 )
 
 func uint32ptr(v uint32) *xdr.Uint32 { u := xdr.Uint32(v); return &u }
+
 func accountIDptr(addr string) *xdr.AccountId {
 	id := xdr.MustAddress(addr)
 	return &id
 }
+
 func string32ptr(s string) *xdr.String32 { v := xdr.String32(s); return &v }
 
-// assertDetail is a small helper that fails the test if key is absent or the
-// value does not JSON-equal want.
 func assertDetail(t *testing.T, details map[string]interface{}, key string, want interface{}) {
 	t.Helper()
 	got, ok := details[key]
@@ -42,7 +37,6 @@ func assertDetail(t *testing.T, details map[string]interface{}, key string, want
 		t.Errorf("details[%q] is missing (details: %v)", key, details)
 		return
 	}
-	// Compare via JSON round-trip so numeric types don't cause false mismatches.
 	wantJSON, _ := json.Marshal(want)
 	gotJSON, _ := json.Marshal(got)
 	if string(wantJSON) != string(gotJSON) {
@@ -57,11 +51,13 @@ func assertDetailAbsent(t *testing.T, details map[string]interface{}, key string
 	}
 }
 
-// ── set_options ───────────────────────────────────────────────────────────────
+func newStoreOp() store.Operation {
+	return store.Operation{}
+}
+
+// set_options
 
 func TestExtractOperationDetails_SetOptions_Full(t *testing.T) {
-	// Build a SignerKey from a G-address: AccountId is a typedef of PublicKey,
-	// both backed by the same raw ed25519 bytes.
 	accountID := xdr.MustAddress(acctB)
 	ed25519 := accountID.MustEd25519()
 	signerKey := xdr.SignerKey{
@@ -104,7 +100,6 @@ func TestExtractOperationDetails_SetOptions_Full(t *testing.T) {
 }
 
 func TestExtractOperationDetails_SetOptions_Sparse(t *testing.T) {
-	// Only home_domain is set; optional fields should be absent.
 	op := xdr.Operation{
 		Body: xdr.OperationBody{
 			Type: xdr.OperationTypeSetOptions,
@@ -124,8 +119,6 @@ func TestExtractOperationDetails_SetOptions_Sparse(t *testing.T) {
 	assertDetailAbsent(t, details, "signer_key")
 }
 
-// enrichOperation has no promoted columns for set_options; the store.Operation
-// fields that matter (Destination, Amount, AssetCode) must remain nil.
 func TestEnrichOperation_SetOptions_NoPromotedColumns(t *testing.T) {
 	op := xdr.Operation{
 		Body: xdr.OperationBody{
@@ -146,7 +139,7 @@ func TestEnrichOperation_SetOptions_NoPromotedColumns(t *testing.T) {
 	}
 }
 
-// ── account_merge ─────────────────────────────────────────────────────────────
+// account_merge
 
 func TestExtractOperationDetails_AccountMerge(t *testing.T) {
 	dest, err := xdr.AddressToMuxedAccount(acctA)
@@ -188,13 +181,12 @@ func TestEnrichOperation_AccountMerge_SetsDestination(t *testing.T) {
 	if *storeOp.Destination != acctA {
 		t.Errorf("account_merge: Destination = %q, want %q", *storeOp.Destination, acctA)
 	}
-	// plain G-address → no muxed fields
 	if storeOp.DestinationMuxed != nil {
 		t.Errorf("account_merge: expected nil DestinationMuxed for plain address")
 	}
 }
 
-// ── bump_sequence ─────────────────────────────────────────────────────────────
+// bump_sequence
 
 func TestExtractOperationDetails_BumpSequence(t *testing.T) {
 	op := xdr.Operation{
@@ -232,7 +224,7 @@ func TestEnrichOperation_BumpSequence_NoPromotedColumns(t *testing.T) {
 	}
 }
 
-// ── manage_data ───────────────────────────────────────────────────────────────
+// manage_data
 
 func TestExtractOperationDetails_ManageData_Set(t *testing.T) {
 	val := xdr.DataValue([]byte("hello"))
@@ -250,12 +242,10 @@ func TestExtractOperationDetails_ManageData_Set(t *testing.T) {
 
 	assertDetail(t, details, "type", "manage_data")
 	assertDetail(t, details, "name", "my-key")
-	// value is hex-encoded bytes
-	assertDetail(t, details, "value", "68656c6c6f") // "hello" in hex
+	assertDetail(t, details, "value", "aGVsbG8=") // "hello" in base64
 }
 
 func TestExtractOperationDetails_ManageData_Delete(t *testing.T) {
-	// nil DataValue means "delete the entry"
 	op := xdr.Operation{
 		Body: xdr.OperationBody{
 			Type: xdr.OperationTypeManageData,
@@ -296,7 +286,7 @@ func TestEnrichOperation_ManageData_NoPromotedColumns(t *testing.T) {
 	}
 }
 
-// ── inflation ─────────────────────────────────────────────────────────────────
+// inflation
 
 func TestExtractOperationDetails_Inflation(t *testing.T) {
 	op := xdr.Operation{
@@ -308,7 +298,6 @@ func TestExtractOperationDetails_Inflation(t *testing.T) {
 	details := extractOperationDetails(op)
 
 	assertDetail(t, details, "type", "inflation")
-	// inflation has no extra fields
 	if len(details) != 1 {
 		t.Errorf("inflation: expected exactly 1 detail key (type), got %d: %v", len(details), details)
 	}
@@ -328,11 +317,4 @@ func TestEnrichOperation_Inflation_NoPromotedColumns(t *testing.T) {
 	if storeOp.Destination != nil || storeOp.Amount != nil || storeOp.AssetCode != nil {
 		t.Errorf("inflation: all promoted columns should be nil")
 	}
-}
-
-// ── newStoreOp ────────────────────────────────────────────────────────────────
-
-// newStoreOp returns a zero-value store.Operation for use in enrichOperation tests.
-func newStoreOp() store.Operation {
-	return store.Operation{}
 }

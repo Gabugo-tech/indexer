@@ -1,6 +1,7 @@
 package transform
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -355,7 +356,7 @@ func extractOperationDetails(op xdr.Operation) map[string]interface{} {
 		o := op.Body.MustManageDataOp()
 		details["name"] = string(o.DataName)
 		if o.DataValue != nil {
-			details["value"] = fmt.Sprintf("%x", []byte(*o.DataValue))
+			details["value"] = base64.StdEncoding.EncodeToString([]byte(*o.DataValue))
 		}
 	case xdr.OperationTypeInflation:
 		// inflation has no parameters; the "type" entry set above is its complete detail.
