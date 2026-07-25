@@ -169,7 +169,7 @@ func TestTokenEventsFromLedgerMeta_EmptyMeta(t *testing.T) {
 
 func TestToBaseAccount(t *testing.T) {
 	// Regular G... address — should pass through unchanged.
-	g := "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+	g := "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
 	base, mux := toBaseAccount(g)
 	if base != g {
 		t.Errorf("G address: base = %q, want %q", base, g)
