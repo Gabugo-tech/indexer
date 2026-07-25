@@ -32,7 +32,7 @@ func TestScValToString_Void(t *testing.T) {
 }
 
 func TestScValToString_Address_Account(t *testing.T) {
-	const addr = "GBRPYHIL2CI3WHZDTOOQFC6EB4RBMNSQGZUZU3JPGZPF5DVDXZ3D5KU"
+	const addr = "GBKPF4URAGUGPBFKQNMDDD4IY5BRRXRK2VEBULJEMVULCCODND436NIO"
 	accountID := xdr.MustAddress(addr)
 	scAddr := xdr.ScAddress{
 		Type:      xdr.ScAddressTypeScAddressTypeAccount,
