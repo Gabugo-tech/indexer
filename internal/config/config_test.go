@@ -18,9 +18,6 @@ func TestLoad_RPCEndpointOptional(t *testing.T) {
 }
 
 func TestLoad_Defaults(t *testing.T) {
-	os.Setenv("RPC_ENDPOINT", "https://rpc.example.com")
-	defer os.Unsetenv("RPC_ENDPOINT")
-
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -40,12 +37,8 @@ func TestLoad_Defaults(t *testing.T) {
 }
 
 func TestLoad_MetricsAddrOptIn(t *testing.T) {
-	os.Setenv("RPC_ENDPOINT", "https://rpc.example.com")
 	os.Setenv("METRICS_ADDR", ":9090")
-	defer func() {
-		os.Unsetenv("RPC_ENDPOINT")
-		os.Unsetenv("METRICS_ADDR")
-	}()
+	defer os.Unsetenv("METRICS_ADDR")
 
 	cfg, err := Load()
 	if err != nil {
@@ -57,11 +50,9 @@ func TestLoad_MetricsAddrOptIn(t *testing.T) {
 }
 
 func TestLoad_EnvOverride(t *testing.T) {
-	os.Setenv("RPC_ENDPOINT", "https://rpc.example.com")
 	os.Setenv("NETWORK", "testnet")
 	os.Setenv("BATCH_SIZE", "200")
 	defer func() {
-		os.Unsetenv("RPC_ENDPOINT")
 		os.Unsetenv("NETWORK")
 		os.Unsetenv("BATCH_SIZE")
 	}()
@@ -75,5 +66,55 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.BatchSize != 200 {
 		t.Errorf("expected batch size 200, got %d", cfg.BatchSize)
+	}
+}
+
+func TestLoad_InvalidNetwork(t *testing.T) {
+	os.Setenv("NETWORK", "mainnet")
+	defer os.Unsetenv("NETWORK")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for invalid NETWORK, got nil")
+	}
+}
+
+func TestLoad_ZeroWorkerCount(t *testing.T) {
+	os.Setenv("WORKER_COUNT", "0")
+	defer os.Unsetenv("WORKER_COUNT")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for WORKER_COUNT=0, got nil")
+	}
+}
+
+func TestLoad_NegativeWorkerCount(t *testing.T) {
+	os.Setenv("WORKER_COUNT", "-1")
+	defer os.Unsetenv("WORKER_COUNT")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for WORKER_COUNT=-1, got nil")
+	}
+}
+
+func TestLoad_ZeroBatchSize(t *testing.T) {
+	os.Setenv("BATCH_SIZE", "0")
+	defer os.Unsetenv("BATCH_SIZE")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for BATCH_SIZE=0, got nil")
+	}
+}
+
+func TestLoad_NegativeBatchSize(t *testing.T) {
+	os.Setenv("BATCH_SIZE", "-5")
+	defer os.Unsetenv("BATCH_SIZE")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for BATCH_SIZE=-5, got nil")
 	}
 }

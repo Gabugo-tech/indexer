@@ -11,12 +11,9 @@ import (
 type Config struct {
 	DatabaseURL  string
 	RedisURL     string
-	TypesenseURL string
-	TypesenseKey string
 	RPCEndpoint  string
 	DataLakePath string
 	Network      string // "public", "testnet", "futurenet"
-	StartLedger  uint32
 	BatchSize    int
 	WorkerCount  int
 	MetricsAddr  string // listen address for /metrics and /healthz; disabled when empty
@@ -26,8 +23,6 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		DatabaseURL:  getEnv("DATABASE_URL", "postgresql://explorer:explorer_dev@localhost:54320/stellar_explorer?sslmode=disable"),
 		RedisURL:     getEnv("REDIS_URL", "redis://localhost:63790"),
-		TypesenseURL: getEnv("TYPESENSE_URL", "http://localhost:18108"),
-		TypesenseKey: getEnv("TYPESENSE_KEY", "explorer_dev_key"),
 		RPCEndpoint:  getEnv("RPC_ENDPOINT", ""),
 		DataLakePath: getEnv("DATA_LAKE_PATH", "s3://aws-public-blockchain/v1.1/stellar/ledgers/pubnet"),
 		Network:      getEnv("NETWORK", "public"),
@@ -36,7 +31,30 @@ func Load() (*Config, error) {
 		MetricsAddr:  getEnv("METRICS_ADDR", ""),
 	}
 
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+func (c *Config) validate() error {
+	switch c.Network {
+	case "public", "testnet", "futurenet":
+		// valid
+	default:
+		return fmt.Errorf("invalid NETWORK %q: must be one of public, testnet, futurenet", c.Network)
+	}
+
+	if c.WorkerCount <= 0 {
+		return fmt.Errorf("invalid WORKER_COUNT %d: must be > 0", c.WorkerCount)
+	}
+
+	if c.BatchSize <= 0 {
+		return fmt.Errorf("invalid BATCH_SIZE %d: must be > 0", c.BatchSize)
+	}
+
+	return nil
 }
 
 // NetworkPassphrase returns the Stellar network passphrase for the configured network.
