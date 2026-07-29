@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miguelnietoa/stellar-explorer/indexer/internal/health"
@@ -19,6 +21,59 @@ type Publisher interface {
 	PublishTransactions(ctx context.Context, txs []store.Transaction) error
 }
 
+// contractSpecWorkerPool is a bounded pool of goroutines that process contract
+// specs. It replaces the unbounded fire-and-forget go transform.ProcessContractSpec(...)
+// calls so concurrency is capped and shutdown drains all in-flight work.
+type contractSpecWorkerPool struct {
+	queue   chan contractSpecJob
+	wg      sync.WaitGroup
+	dropped atomic.Int64 // jobs dropped because the caller's context was cancelled
+}
+
+type contractSpecJob struct {
+	ctx      context.Context
+	rpc      *source.RPCClient
+	db       *store.PostgresStore
+	contract transform.DetectedContract
+}
+
+// newContractSpecWorkerPool starts workerCount goroutines that pull jobs from
+// the returned pool. Call stop() to drain and shut down cleanly.
+func newContractSpecWorkerPool(ctx context.Context, workerCount int) *contractSpecWorkerPool {
+	// Buffer the channel to reduce blocking on the ingestion hot path during
+	// short bursts. Once the buffer is full, submit() will block until a worker
+	// picks up a job or the caller's context is cancelled.
+	p := &contractSpecWorkerPool{
+		queue: make(chan contractSpecJob, 512),
+	}
+	for i := 0; i < workerCount; i++ {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			for job := range p.queue {
+				transform.ProcessContractSpec(job.ctx, job.rpc, job.db, job.contract)
+			}
+		}()
+	}
+	return p
+}
+
+// submit enqueues a contract spec job. If the pipeline context is already
+// cancelled the job is dropped and the dropped counter is incremented.
+func (p *contractSpecWorkerPool) submit(ctx context.Context, rpc *source.RPCClient, db *store.PostgresStore, contract transform.DetectedContract) {
+	select {
+	case p.queue <- contractSpecJob{ctx: ctx, rpc: rpc, db: db, contract: contract}:
+	case <-ctx.Done():
+		p.dropped.Add(1)
+	}
+}
+
+// stop closes the job queue and waits for all in-flight workers to finish.
+func (p *contractSpecWorkerPool) stop() {
+	close(p.queue)
+	p.wg.Wait()
+}
+
 // LivePipeline polls the Stellar RPC for new ledgers and ingests them.
 type LivePipeline struct {
 	rpc               *source.RPCClient
@@ -26,7 +81,12 @@ type LivePipeline struct {
 	publisher         Publisher
 	networkPassphrase string
 	batchSize         int
+	// workerCount controls the contract-spec worker pool size (defaults to 4).
+	workerCount int
 }
+
+// defaultContractSpecWorkers is used when no explicit count is provided.
+const defaultContractSpecWorkers = 4
 
 func NewLivePipeline(rpc *source.RPCClient, store *store.PostgresStore, networkPassphrase string, batchSize int) *LivePipeline {
 	return &LivePipeline{
@@ -34,7 +94,17 @@ func NewLivePipeline(rpc *source.RPCClient, store *store.PostgresStore, networkP
 		store:             store,
 		networkPassphrase: networkPassphrase,
 		batchSize:         batchSize,
+		workerCount:       defaultContractSpecWorkers,
 	}
+}
+
+// WithContractSpecWorkers sets the number of concurrent contract-spec workers.
+// Must be called before Run.
+func (p *LivePipeline) WithContractSpecWorkers(n int) *LivePipeline {
+	if n > 0 {
+		p.workerCount = n
+	}
+	return p
 }
 
 func (p *LivePipeline) SetPublisher(pub Publisher) {
@@ -45,6 +115,13 @@ func (p *LivePipeline) SetPublisher(pub Publisher) {
 func (p *LivePipeline) Run(ctx context.Context) error {
 	log.Println("live pipeline: starting")
 
+	pool := newContractSpecWorkerPool(ctx, p.workerCount)
+	defer func() {
+		log.Println("live pipeline: draining contract-spec workers")
+		pool.stop()
+		log.Println("live pipeline: contract-spec workers drained")
+	}()
+
 	gapTicker := time.NewTicker(5 * time.Minute)
 	defer gapTicker.Stop()
 
@@ -54,11 +131,11 @@ func (p *LivePipeline) Run(ctx context.Context) error {
 			log.Println("live pipeline: stopping")
 			return ctx.Err()
 		case <-gapTicker.C:
-			p.detectAndFillGaps(ctx)
+			p.detectAndFillGaps(ctx, pool)
 		default:
 		}
 
-		ingested, err := p.ingestNewLedgers(ctx)
+		ingested, err := p.ingestNewLedgers(ctx, pool)
 		if err != nil {
 			log.Printf("live pipeline: ingestion error: %v", err)
 			select {
@@ -79,7 +156,7 @@ func (p *LivePipeline) Run(ctx context.Context) error {
 	}
 }
 
-func (p *LivePipeline) ingestNewLedgers(ctx context.Context) (int, error) {
+func (p *LivePipeline) ingestNewLedgers(ctx context.Context, pool *contractSpecWorkerPool) (int, error) {
 	latest, err := p.rpc.GetLatestLedger(ctx)
 	if err != nil {
 		metrics.RPCErrors.Inc()
@@ -123,7 +200,7 @@ func (p *LivePipeline) ingestNewLedgers(ctx context.Context) (int, error) {
 			limit = remaining
 		}
 
-		count, err := p.processLedgerBatch(ctx, cursor, limit)
+		count, err := p.processLedgerBatch(ctx, cursor, limit, pool)
 		if err != nil {
 			return totalIngested, fmt.Errorf("processLedgerBatch at %d: %w", cursor, err)
 		}
@@ -135,7 +212,7 @@ func (p *LivePipeline) ingestNewLedgers(ctx context.Context) (int, error) {
 	return totalIngested, nil
 }
 
-func (p *LivePipeline) processLedgerBatch(ctx context.Context, startLedger uint32, limit int) (int, error) {
+func (p *LivePipeline) processLedgerBatch(ctx context.Context, startLedger uint32, limit int, pool *contractSpecWorkerPool) (int, error) {
 	// Fetch ledgers
 	ledgerResult, err := p.rpc.GetLedgers(ctx, source.GetLedgersParams{
 		StartLedger: startLedger,
@@ -200,7 +277,7 @@ func (p *LivePipeline) processLedgerBatch(ctx context.Context, startLedger uint3
 	// Process each ledger
 	processed := 0
 	for _, ledgerEntry := range ledgerResult.Ledgers {
-		if err := p.processOneLedger(ctx, ledgerEntry, txByLedger[ledgerEntry.Sequence]); err != nil {
+		if err := p.processOneLedger(ctx, ledgerEntry, txByLedger[ledgerEntry.Sequence], pool); err != nil {
 			return processed, fmt.Errorf("processLedger %d: %w", ledgerEntry.Sequence, err)
 		}
 		processed++
@@ -209,14 +286,16 @@ func (p *LivePipeline) processLedgerBatch(ctx context.Context, startLedger uint3
 	return processed, nil
 }
 
-func (p *LivePipeline) processOneLedger(ctx context.Context, ledgerEntry source.LedgerEntry, txEntries []source.TransactionEntry) error {
-	return ProcessOneLedger(ctx, p.rpc, p.store, p.publisher, p.networkPassphrase, ledgerEntry, txEntries)
+func (p *LivePipeline) processOneLedger(ctx context.Context, ledgerEntry source.LedgerEntry, txEntries []source.TransactionEntry, pool *contractSpecWorkerPool) error {
+	return ProcessOneLedger(ctx, p.rpc, p.store, p.publisher, p.networkPassphrase, ledgerEntry, txEntries, pool)
 }
 
 // ProcessOneLedger transforms and stores a single ledger with its transactions and operations.
 // It is exported so that different pipeline implementations (live, backfill, S3) can reuse it.
-// rpc may be nil — when provided, new contracts discovered in the ledger are processed asynchronously.
-func ProcessOneLedger(ctx context.Context, rpc *source.RPCClient, db *store.PostgresStore, pub Publisher, networkPassphrase string, ledgerEntry source.LedgerEntry, txEntries []source.TransactionEntry) error {
+// rpc may be nil — when provided, new contracts discovered in the ledger are submitted to pool
+// for bounded async processing. pool may be nil (backfill/S3 paths), in which case contract
+// spec processing is skipped entirely.
+func ProcessOneLedger(ctx context.Context, rpc *source.RPCClient, db *store.PostgresStore, pub Publisher, networkPassphrase string, ledgerEntry source.LedgerEntry, txEntries []source.TransactionEntry, pool *contractSpecWorkerPool) error {
 	// Transform ledger
 	ledger, err := transform.LedgerFromRPC(ledgerEntry)
 	if err != nil {
@@ -291,19 +370,19 @@ func ProcessOneLedger(ctx context.Context, rpc *source.RPCClient, db *store.Post
 		metrics.DBErrors.Inc()
 		return fmt.Errorf("insert operations: %w", err)
 	}
-	// Detect newly created contracts and process their specs asynchronously
-	if rpc != nil && ledgerEntry.MetadataXDR != "" {
+	// Detect newly created contracts and submit them to the bounded worker pool.
+	if rpc != nil && pool != nil && ledgerEntry.MetadataXDR != "" {
 		closedAt := ledger.ClosedAt
 		if detected, err := transform.DetectNewContracts(ledgerEntry.MetadataXDR, ledgerEntry.Sequence, closedAt); err != nil {
 			log.Printf("ledger %d: detect contracts warning: %v", ledgerEntry.Sequence, err)
 		} else {
 			log.Printf("ledger %d: detected %d new contracts", ledgerEntry.Sequence, len(detected))
 			for _, c := range detected {
-				go transform.ProcessContractSpec(context.Background(), rpc, db, c)
+				pool.submit(ctx, rpc, db, c)
 			}
 		}
 	} else {
-		log.Printf("ledger %d: skipping contract detection (rpc=%v metaXDR_empty=%v)", ledgerEntry.Sequence, rpc == nil, ledgerEntry.MetadataXDR == "")
+		log.Printf("ledger %d: skipping contract detection (rpc=%v pool=%v metaXDR_empty=%v)", ledgerEntry.Sequence, rpc == nil, pool == nil, ledgerEntry.MetadataXDR == "")
 	}
 
 	if err := db.InsertTokenEventBatch(ctx, tokenEvents); err != nil {
@@ -372,7 +451,7 @@ func contiguousRanges(seqs []uint32) []ledgerRange {
 // ingested ledger that have no row in the ledgers table (e.g. left behind by
 // a network blip, restart, or RPC outage) and re-ingests them via RPC,
 // reusing the same processing path as normal live ingestion.
-func (p *LivePipeline) detectAndFillGaps(ctx context.Context) {
+func (p *LivePipeline) detectAndFillGaps(ctx context.Context, pool *contractSpecWorkerPool) {
 	log.Println("live pipeline: running gap detection")
 
 	minSeq, maxSeq, err := p.store.GetLedgerSequenceBounds(ctx)
@@ -398,7 +477,7 @@ func (p *LivePipeline) detectAndFillGaps(ctx context.Context) {
 	log.Printf("live pipeline: gap detection: found %d missing ledger(s) between %d and %d", len(missing), minSeq, maxSeq)
 
 	for _, r := range contiguousRanges(missing) {
-		filled, err := p.fillGapRange(ctx, r)
+		filled, err := p.fillGapRange(ctx, r, pool)
 		if err != nil {
 			log.Printf("live pipeline: gap fill failed for range %d-%d: %v", r.start, r.end, err)
 			continue
@@ -409,7 +488,7 @@ func (p *LivePipeline) detectAndFillGaps(ctx context.Context) {
 
 // fillGapRange re-fetches and re-ingests every ledger in [r.start, r.end],
 // chunking the work by the pipeline's normal batch size.
-func (p *LivePipeline) fillGapRange(ctx context.Context, r ledgerRange) (int, error) {
+func (p *LivePipeline) fillGapRange(ctx context.Context, r ledgerRange, pool *contractSpecWorkerPool) (int, error) {
 	filled := 0
 	cursor := r.start
 	for cursor <= r.end {
@@ -425,7 +504,7 @@ func (p *LivePipeline) fillGapRange(ctx context.Context, r ledgerRange) (int, er
 			limit = remaining
 		}
 
-		count, err := p.processLedgerBatch(ctx, cursor, limit)
+		count, err := p.processLedgerBatch(ctx, cursor, limit, pool)
 		if err != nil {
 			return filled, fmt.Errorf("processLedgerBatch at %d: %w", cursor, err)
 		}

@@ -105,7 +105,8 @@ func runLive(cfg *config.Config) {
 		}()
 	}
 
-	p := pipeline.NewLivePipeline(rpc, db, passphrase, cfg.BatchSize)
+	p := pipeline.NewLivePipeline(rpc, db, passphrase, cfg.BatchSize).
+		WithContractSpecWorkers(cfg.WorkerCount)
 
 	// Attach Redis publisher if configured
 	if cfg.RedisURL != "" {

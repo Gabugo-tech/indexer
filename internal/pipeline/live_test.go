@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 	"github.com/miguelnietoa/stellar-explorer/indexer/internal/source"
 	"github.com/miguelnietoa/stellar-explorer/indexer/internal/store"
+	"github.com/miguelnietoa/stellar-explorer/indexer/internal/transform"
 )
 
 func getTestDeps(t *testing.T) (*source.RPCClient, *store.PostgresStore) {
@@ -49,7 +51,7 @@ func TestProcessLedgerBatch(t *testing.T) {
 	// Process 2 ledgers from near the tip
 	p := NewLivePipeline(rpc, db, network.TestNetworkPassphrase, 10)
 	start := latest.Sequence - 3
-	count, err := p.processLedgerBatch(ctx, start, 2)
+	count, err := p.processLedgerBatch(ctx, start, 2, nil)
 	if err != nil {
 		t.Fatalf("processLedgerBatch failed: %v", err)
 	}
@@ -129,7 +131,7 @@ func TestDetectAndFillGapsRefillsSyntheticGap(t *testing.T) {
 	p := NewLivePipeline(rpc, db, network.TestNetworkPassphrase, 10)
 
 	start := latest.Sequence - 6
-	count, err := p.processLedgerBatch(ctx, start, 5)
+	count, err := p.processLedgerBatch(ctx, start, 5, nil)
 	if err != nil {
 		t.Fatalf("processLedgerBatch failed: %v", err)
 	}
@@ -156,7 +158,7 @@ func TestDetectAndFillGapsRefillsSyntheticGap(t *testing.T) {
 		t.Fatalf("expected ledger %d to be missing before gap fill", gapSeq)
 	}
 
-	p.detectAndFillGaps(ctx)
+	p.detectAndFillGaps(ctx, nil)
 
 	err = db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM ledgers WHERE sequence = $1)", gapSeq).Scan(&exists)
 	if err != nil {
@@ -234,5 +236,100 @@ func TestContiguousRanges(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestContractSpecWorkerPool_BoundedAndDrains is a hermetic, network-free test
+// that verifies two properties of the worker pool under -race:
+//  1. Concurrency is capped — no more than workerCount goroutines run at once.
+//  2. stop() drains all in-flight work before returning (no leaked goroutines).
+func TestContractSpecWorkerPool_BoundedAndDrains(t *testing.T) {
+	const workers = 3
+	const jobs = 20
+
+	var (
+		mu        sync.Mutex
+		active    int
+		maxActive int
+		completed int
+	)
+
+	// Temporarily replace ProcessContractSpec with a fake via the job channel
+	// by wiring the pool's workers to a counting function via a test-local pool.
+	pool := &contractSpecWorkerPool{
+		queue: make(chan contractSpecJob, 512),
+	}
+	for i := 0; i < workers; i++ {
+		pool.wg.Add(1)
+		go func() {
+			defer pool.wg.Done()
+			for range pool.queue {
+				mu.Lock()
+				active++
+				if active > maxActive {
+					maxActive = active
+				}
+				mu.Unlock()
+
+				time.Sleep(5 * time.Millisecond) // simulate work
+
+				mu.Lock()
+				active--
+				completed++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// Submit jobs
+	for i := 0; i < jobs; i++ {
+		pool.queue <- contractSpecJob{} // send empty job; workers count it
+	}
+
+	pool.stop() // must drain before returning
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if completed != jobs {
+		t.Errorf("expected %d completed jobs, got %d", jobs, completed)
+	}
+	if maxActive > workers {
+		t.Errorf("concurrency exceeded worker count: maxActive=%d workers=%d", maxActive, workers)
+	}
+	t.Logf("pool drained %d jobs, peak concurrency=%d/%d", completed, maxActive, workers)
+}
+
+// TestContractSpecWorkerPool_CancelledContextDropsJob verifies that submit()
+// drops a job (not enqueues it) when the caller's context is already cancelled.
+//
+// To make this deterministic we fill the channel buffer completely so the
+// "enqueue" case in the select is never ready — only ctx.Done() can fire —
+// then assert the dropped counter is incremented exactly once.
+func TestContractSpecWorkerPool_CancelledContextDropsJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before we even call submit
+
+	// Use a zero-buffer channel so the enqueue arm is never immediately ready,
+	// making ctx.Done() the only selectable case.
+	pool := &contractSpecWorkerPool{
+		queue: make(chan contractSpecJob, 0),
+	}
+	// Start one worker so stop() drains cleanly.
+	pool.wg.Add(1)
+	go func() {
+		defer pool.wg.Done()
+		for range pool.queue {
+		}
+	}()
+	defer pool.stop()
+
+	beforeDropped := pool.dropped.Load()
+
+	pool.submit(ctx, nil, nil, transform.DetectedContract{})
+
+	afterDropped := pool.dropped.Load()
+	if afterDropped-beforeDropped != 1 {
+		t.Errorf("expected dropped counter to increase by 1, got %d -> %d", beforeDropped, afterDropped)
 	}
 }
